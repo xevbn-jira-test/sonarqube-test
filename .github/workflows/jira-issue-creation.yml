@@ -45,12 +45,23 @@ jobs:
             }
             const tpl = fs.readFileSync(path.join(process.cwd(), file), 'utf8');
 
+            // 설명이 비어 있으면 ISSUE_TEMPLATE/{유형}.md 본문으로 대체
+            let description = esc(p.description).trim();
+            const kindTpl = path.join(process.cwd(), `.github/ISSUE_TEMPLATE/${kind}.md`);
+            if (!description && fs.existsSync(kindTpl)) {
+              description = fs.readFileSync(kindTpl, 'utf8')
+                .replace(/^---[\s\S]*?\n---\s*\n?/, '')   // front matter 제거
+                .trim();
+              core.info(`Jira 설명이 비어 있어 ${kind}.md 템플릿으로 대체`);
+            }
+            core.info(`kind=${kind}, description length=${description.length}`);
+
             // 템플릿 치환
             const values = {
               key:         esc(p.key),
               url:         esc(p.url),
               summary:     esc(p.summary),
-              description: esc(p.description),
+              description,
               initiator:   nz(p.initiator, '-'),
               priority:    nz(p.priority, '-'),
               duedate:     nz(p.duedate, '미정'),
