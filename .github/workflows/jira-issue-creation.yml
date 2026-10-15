@@ -1,15 +1,19 @@
-name: Create GitHub Issue from Jira
+name: Jira → GitHub
 
 on:
   repository_dispatch:
-    types: [jira-issue]
+    types: [jira-issue, jira-start]   # jira-issue: 이슈 발행 / jira-start: 진행 중 전환
 
 permissions:
-  contents: read
+  contents: write   # 브랜치 생성
   issues: write
 
 jobs:
+  # ─────────────────────────────────────────────
+  # 1. 업무 발행 → GitHub 이슈 생성
+  # ─────────────────────────────────────────────
   create-issue:
+    if: github.event.action == 'jira-issue'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,93 +26,125 @@ jobs:
             const path = require('path');
 
             const p = context.payload.client_payload || {};
+            const { owner, repo } = context.repo;
             const kind = (p.kind || '').toLowerCase();
 
             const esc = (s) => (s ?? '').toString();
-            const nz  = (s, fallback='') => {
+            const nz  = (s, fallback = '') => {
               const v = (s ?? '').toString().trim();
               return v.length ? v : fallback;
             };
-            const decodeMaybe = (s) => {
-              const str = esc(s);
-              // Jira에서 urlEncode 했으면 % 기호 포함 → decodeURIComponent 적용
-              try {
-                return /%[0-9A-Fa-f]{2}/.test(str) ? decodeURIComponent(str) : str;
-              } catch { return str; }
-            };
 
-            // 1) 템플릿 선택
-            const mapping = {
-              story: '.github/ISSUE_TEMPLATE/automation-story.md',
-              bug:   '.github/ISSUE_TEMPLATE/automation-bug.md',
-              task:  '.github/ISSUE_TEMPLATE/automation-task.md'
-            };
-            const file = mapping[kind] || mapping.task;
-            const templatePath = path.join(process.cwd(), file);
-            if (!fs.existsSync(templatePath)) {
-              core.setFailed(`Template not found: ${file}`);
+            // 템플릿 선택: 유형별 파일이 있으면 사용, 없으면 default.md
+            const dir = '.github/automation-templates';
+            const candidates = [`${dir}/${kind}.md`, `${dir}/default.md`];
+            const file = candidates.find(f => fs.existsSync(path.join(process.cwd(), f)));
+            if (!file) {
+              core.setFailed(`Template not found: ${candidates.join(', ')}`);
               return;
             }
-            const tpl = fs.readFileSync(templatePath, 'utf8');
+            const tpl = fs.readFileSync(path.join(process.cwd(), file), 'utf8');
 
-            // 2) 값 준비
-            const key         = esc(p.key);
-            const url         = esc(p.url);
-            const summary     = esc(p.summary);
-            const description = esc(p.description);
-            const initiator   = esc(p.initiator);
-            const priority    = esc(p.priority);
-            const duedate     = nz(p.duedate, '미정');
-            const checklist   = decodeMaybe(p.checklist);
-
-            // 3) 템플릿 치환
-            let body = tpl
-              .replaceAll('{{issue.key}}', key)
-              .replaceAll('{{key}}', key)
-              .replaceAll('{{issue.url}}', url)
-              .replaceAll('{{url}}', url)
-              .replaceAll('{{issue.summary}}', summary)
-              .replaceAll('{{summary}}', summary)
-              .replaceAll('{{description}}', description)
-              .replaceAll('{{initiator}}', initiator)
-              .replaceAll('{{priority}}', priority)
-              .replaceAll('{{issue.duedate}}', duedate)
-              .replaceAll('{{duedate}}', duedate)
-              .replaceAll('{{checklist}}', checklist || '');
-
-            // 템플릿에 {{checklist}}가 없다면 섹션을 추가로 붙여줌
-            if (checklist && !tpl.includes('{{checklist}}')) {
-              body += `\n\n---\n\n## ✅ To-Do\n${checklist}\n`;
+            // 템플릿 치환
+            const values = {
+              key:         esc(p.key),
+              url:         esc(p.url),
+              summary:     esc(p.summary),
+              description: esc(p.description),
+              initiator:   nz(p.initiator, '-'),
+              priority:    nz(p.priority, '-'),
+              duedate:     nz(p.duedate, '미정'),
+              kind,
+            };
+            let body = tpl;
+            for (const [k, v] of Object.entries(values)) {
+              body = body.replaceAll(`{{${k}}}`, v).replaceAll(`{{issue.${k}}}`, v);
             }
 
-            // 4) 라벨 결정
-            const allowed = new Set(['Feature','Refactor','Documentation']);
-            let labels = [];
-            if (kind === 'story') labels = ['Story'];
-            else if (kind === 'bug') labels = ['Bug'];
-            else {
-              let incoming = [];
-              if (Array.isArray(p.labels)) incoming = p.labels;
-              else if (typeof p.labels === 'string') {
-                try {
-                  const parsed = JSON.parse(p.labels);
-                  if (Array.isArray(parsed)) incoming = parsed;
-                } catch {
-                  incoming = p.labels.split(',').map(s=>s.trim()).filter(Boolean);
-                }
+            // 라벨: 업무 유형 + Jira 레이블
+            const allowedKinds = new Set(['story', 'feature', 'bug', 'refactoring', 'documentation']);
+            let incoming = [];
+            if (Array.isArray(p.labels)) incoming = p.labels;
+            else if (typeof p.labels === 'string' && p.labels.trim()) {
+              try {
+                const parsed = JSON.parse(p.labels);
+                if (Array.isArray(parsed)) incoming = parsed;
+              } catch {
+                incoming = p.labels.split(',').map(s => s.trim()).filter(Boolean);
               }
-              labels = incoming.filter(v => allowed.has(v));
-              if (labels.length === 0) labels = ['Task'];
+            }
+            const labels = [...new Set([
+              ...(allowedKinds.has(kind) ? [kind] : []),
+              ...incoming,
+            ])];
+
+            const res = await github.rest.issues.create({
+              owner, repo,
+              title: `[${values.key}] ${values.summary}`,
+              body,
+              labels,
+            });
+            core.info(`Created issue #${res.data.number}: ${res.data.html_url}`);
+
+  # ─────────────────────────────────────────────
+  # 2. 진행 중 전환 → 브랜치 생성
+  # ─────────────────────────────────────────────
+  create-branch:
+    if: github.event.action == 'jira-start'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const p = context.payload.client_payload || {};
+            const { owner, repo } = context.repo;
+
+            const key  = (p.key ?? '').toString().trim();
+            const kind = (p.kind ?? '').toString().toLowerCase();
+            if (!key) {
+              core.setFailed('key가 비어 있습니다');
+              return;
             }
 
-            // 5) 이슈 생성
-            const title = `[${key}] ${summary}`;
-            const res = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body,
-              labels
-            });
+            // 브랜치 이름: feature/PROJ-123-kakao-login
+            const prefix = kind === 'documentation' ? 'docs' : (kind || 'feature');
+            const slug = (p.branch_slug ?? '').toString()
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-|-$/g, '');
+            const branch = `${prefix}/${key}${slug ? '-' + slug : ''}`;
 
-            core.info(`Created issue #${res.data.number}`);
+            // 기본 브랜치의 최신 커밋에서 생성
+            const base = context.payload.repository.default_branch;
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: `heads/${base}` });
+
+            let created = false;
+            try {
+              await github.rest.git.createRef({
+                owner, repo,
+                ref: `refs/heads/${branch}`,
+                sha: ref.object.sha,
+              });
+              created = true;
+              core.info(`Created branch: ${branch}`);
+            } catch (e) {
+              if (e.status === 422) core.warning(`Branch already exists: ${branch}`);
+              else throw e;
+            }
+
+            // 연결된 GitHub 이슈에 브랜치 이름 댓글 (있을 때만)
+            if (created) {
+              const { data: found } = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${owner}/${repo} is:issue in:title "[${key}]"`,
+              });
+              const issue = found.items[0];
+              if (issue) {
+                await github.rest.issues.createComment({
+                  owner, repo,
+                  issue_number: issue.number,
+                  body: `🌿 작업 브랜치: \`${branch}\`\n\n\`\`\`\ngit fetch && git switch ${branch}\n\`\`\``,
+                });
+              }
+            }
