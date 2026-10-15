@@ -62,7 +62,7 @@ jobs:
             }
 
             // 라벨: 업무 유형 + Jira 레이블
-            const allowedKinds = new Set(['story', 'feature', 'bug', 'refactoring', 'documentation']);
+            const allowedKinds = new Set(['epic', 'feature', 'bug', 'refactoring', 'documentation']);
             let incoming = [];
             if (Array.isArray(p.labels)) incoming = p.labels;
             else if (typeof p.labels === 'string' && p.labels.trim()) {
@@ -104,6 +104,11 @@ jobs:
             const kind = (p.kind ?? '').toString().toLowerCase();
             if (!key) {
               core.setFailed('key가 비어 있습니다');
+              return;
+            }
+            // 에픽은 하위 업무에서 작업하므로 브랜치를 만들지 않음
+            if (kind === 'epic') {
+              core.info('Epic은 브랜치를 생성하지 않습니다');
               return;
             }
 
